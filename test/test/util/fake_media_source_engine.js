@@ -112,6 +112,13 @@ shaka.test.FakeMediaSourceEngine = class {
         .and.callFake((type, time) => this.bufferedAheadOfImpl(type, time));
 
     /** @type {!jasmine.Spy} */
+    this.isBufferFull = jasmine.createSpy('isBufferFull')
+        .and.returnValue(false);
+
+    /** @type {!jasmine.Spy} */
+    this.cancelQuotaRecovery = jasmine.createSpy('cancelQuotaRecovery');
+
+    /** @type {!jasmine.Spy} */
     this.bufferedBehindOf = jasmine.createSpy('bufferedBehindOf')
         .and.callFake((type, time) => this.bufferedBehindOfImpl(type, time));
 

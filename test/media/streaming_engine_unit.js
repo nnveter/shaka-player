@@ -3487,6 +3487,87 @@ describe('StreamingEngine', () => {
   });
 
   describe('QuotaExceededError', () => {
+    describe('byte budget', () => {
+      let config;
+
+      beforeEach(() => {
+        setupVod();
+        config = shaka.util.PlayerConfiguration.createDefault().streaming;
+        config.rebufferingGoal = 1;
+        config.bufferingGoal = 30;
+        mediaSourceEngine = new shaka.test.FakeMediaSourceEngine(segmentData);
+        createStreamingEngine(config);
+        Object.defineProperty(video, 'paused',
+            {get: () => false, configurable: true});
+        Object.defineProperty(video, 'readyState',
+            {get: () => 4, configurable: true});
+      });
+
+      it('waits for byte capacity without blocking the other stream',
+          async () => {
+            mediaSourceEngine.isBufferFull.and.callFake((type, time) =>
+              type == ContentType.VIDEO && time < 10);
+            streamingEngine.switchVariant(variant);
+            await streamingEngine.start();
+            await Util.fakeEventLoop(10);
+            expect(mediaSourceEngine.segments[ContentType.VIDEO])
+                .toEqual([true, false, false, false]);
+            // Audio is limited only by the usual run-ahead rule (one segment
+            // ahead of video), not by the video byte budget.
+            expect(mediaSourceEngine.segments[ContentType.AUDIO])
+                .toEqual([true, true, false, false]);
+            playing = true;
+            await runTest();
+            expect(mediaSourceEngine.endOfStream).toHaveBeenCalled();
+            expect(onError).not.toHaveBeenCalled();
+          });
+
+      it('does not stop fetching at the byte cap while rebuffering',
+          async () => {
+            mediaSourceEngine.isBufferFull.and.returnValue(true);
+            Object.defineProperty(video, 'readyState',
+                {get: () => 2, configurable: true});
+            streamingEngine.switchVariant(variant);
+            await streamingEngine.start();
+            await Util.fakeEventLoop(10);
+            expect(mediaSourceEngine.segments[ContentType.VIDEO])
+                .toEqual([true, true, true, false]);
+          });
+
+      it('updates append recovery policy on configuration and rate changes',
+          async () => {
+            streamingEngine.switchVariant(variant);
+            await streamingEngine.start();
+            await Util.fakeEventLoop(5);
+            // Init segments are appended without a recovery callback.
+            const mediaCall = mediaSourceEngine.appendBuffer.calls.all()
+                .filter((call) => call.args[2]).pop();
+            const canRecover = mediaCall.args[10];
+            expect(canRecover()).toBe(true);
+            config.avoidEvictionOnQuotaExceededError = true;
+            streamingEngine.configure(config);
+            expect(canRecover()).toBe(false);
+            config.avoidEvictionOnQuotaExceededError = false;
+            getPlaybackRate.and.returnValue(-1);
+            expect(canRecover()).toBe(false);
+            getPlaybackRate.and.returnValue(1);
+            expect(canRecover()).toBe(true);
+          });
+
+      it('cancels prepared quota waits on switches and seeks', async () => {
+        streamingEngine.switchVariant(variant);
+        await streamingEngine.start();
+        await Util.fakeEventLoop(5);
+        mediaSourceEngine.cancelQuotaRecovery.calls.reset();
+        streamingEngine.switchVariant(alternateVariant);
+        expect(mediaSourceEngine.cancelQuotaRecovery)
+            .toHaveBeenCalledWith(ContentType.VIDEO);
+        mediaSourceEngine.cancelQuotaRecovery.calls.reset();
+        streamingEngine.seeked();
+        expect(mediaSourceEngine.cancelQuotaRecovery).toHaveBeenCalledWith();
+      });
+    });
+
     it('does not fail immediately', async () => {
       setupVod();
 

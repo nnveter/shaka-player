@@ -891,6 +891,422 @@ describe('MediaSourceEngine', () => {
     });
   });
 
+  describe('byte quota recovery', () => {
+    beforeEach(async () => {
+      captureEvents(audioSourceBuffer, ['updateend', 'error']);
+      captureEvents(videoSourceBuffer, ['updateend', 'error']);
+      await mediaSourceEngine.init(new Map([
+        [ContentType.AUDIO, fakeAudioStream],
+        [ContentType.VIDEO, fakeVideoStream],
+      ]), false);
+      spyOn(mediaSourceEngine, 'getTimestampAndDispatchMetadata')
+          .and.returnValue({timestamp: null, metadata: [], scte35: []});
+      jasmine.clock().install();
+    });
+
+    afterEach(() => {
+      jasmine.clock().uninstall();
+    });
+
+    /**
+     * @param {number} start
+     * @param {number} end
+     * @param {number} bytes
+     * @param {shaka.util.ManifestParserUtils.ContentType=} type
+     * @param {?function():boolean=} recover
+     * @param {boolean=} chunked
+     * @param {boolean=} fromSplit
+     * @return {!Promise<!shaka.media.MediaSourceEngine.AppendBufferInfo>}
+     */
+    function append(start, end, bytes, type = ContentType.VIDEO,
+        recover = () => true, chunked = false, fromSplit = false) {
+      return mediaSourceEngine.appendBuffer(
+          type, new Uint8Array(bytes), dummyReference(start, end), fakeStream,
+          false, false, false, chunked, fromSplit, undefined, recover);
+    }
+
+    function finish(start, end, type = ContentType.VIDEO) {
+      const buffer = type == ContentType.VIDEO ?
+          videoSourceBuffer : audioSourceBuffer;
+      buffer.buffered = createFakeBuffered([{start, end}]);
+      buffer.updateend();
+    }
+
+    async function seed(type = ContentType.VIDEO) {
+      const first = append(0, 10, 1000, type, () => true, false, true);
+      finish(0, 10, type);
+      await first;
+      const second = append(10, 20, 1000, type, () => true, false, true);
+      finish(0, 20, type);
+      await second;
+    }
+
+    function rejectNext(type = ContentType.VIDEO) {
+      const buffer = type == ContentType.VIDEO ?
+          videoSourceBuffer : audioSourceBuffer;
+      buffer.appendBuffer.and.callFake(() => {
+        buffer.appendBuffer.and.stub();
+        throw new DOMException('full', 'QuotaExceededError');
+      });
+    }
+
+    it('counts successful media bytes, not init or rejected appends',
+        async () => {
+          const init = mediaSourceEngine.appendBuffer(ContentType.VIDEO,
+              new Uint8Array(500), null, fakeStream, false);
+          videoSourceBuffer.updateend();
+          await init;
+          await seed();
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 5))
+              .toBe(1500);
+          rejectNext();
+          await expectAsync(append(20, 30, 1000, ContentType.VIDEO, null))
+              .toBeRejected();
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 5))
+              .toBe(1500);
+        });
+
+    it('learns a budget when actual durations drift from the manifest',
+        async () => {
+          // E.g. HLS durations rounded to whole seconds, or audio segments
+          // ending on an AAC frame boundary.
+          const first = append(0, 10, 1000);
+          finish(0, 10.02);
+          await first;
+          const second = append(10, 20, 1000);
+          finish(0, 20.04);
+          await second;
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+              .toBeCloseTo(1998, 0);
+          mockVideo.currentTime = 1;
+          rejectNext();
+          const pending = append(20, 30, 1000);
+          await Util.fakeEventLoop(1);
+          // Held for space instead of failing to StreamingEngine.
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          // The budget is what was ahead at t=1 (about 1900 bytes).
+          mockVideo.currentTime = 12;
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+          finish(0, 30.06);
+          await pending;
+        });
+
+    it('counts only bytes inside the append window', async () => {
+      videoSourceBuffer.appendWindowEnd = 15;
+      const pending = append(10, 20, 1000);
+      finish(10, 15);
+      await pending;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(500);
+    });
+
+    it('does not count an asynchronous append error as a success', async () => {
+      const pending = append(0, 10, 1000);
+      const rejected = expectAsync(pending).toBeRejected();
+      videoSourceBuffer.error();
+      videoSourceBuffer.updateend();
+      await rejected;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(0);
+    });
+
+    it('reconciles native eviction and replacement without double counting',
+        async () => {
+          await seed();
+          videoSourceBuffer.buffered =
+              createFakeBuffered([{start: 5, end: 20}]);
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+              .toBe(1500);
+          const replacement = append(10, 20, 2000);
+          finish(5, 20);
+          await replacement;
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+              .toBe(2500);
+        });
+
+    it('retries prepared data and holds a heavier VBR segment before append',
+        async () => {
+          await seed();
+          rejectNext();
+          const pending = append(20, 30, 1000);
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 0))
+              .toBe(true);
+          mockVideo.currentTime = 10;
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+          finish(0, 30);
+          await pending;
+
+          const heavy = append(30, 40, 1500);
+          mockVideo.currentTime = 15;
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+          mockVideo.currentTime = 25;
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(5);
+          finish(0, 40);
+          await heavy;
+        });
+
+    it('lets a lower bitrate fill more time under the same byte budget',
+        async () => {
+          await seed();
+          rejectNext();
+          const pending = append(20, 30, 1000);
+          await Util.fakeEventLoop(1);
+          mockVideo.currentTime = 10;
+          await Util.fakeEventLoop(1);
+          finish(0, 30);
+          await pending;
+
+          mockVideo.currentTime = 15;
+          const lowerBitrate = append(30, 50, 500);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(5);
+          finish(0, 50);
+          await lowerBitrate;
+          expect(mediaSourceEngine.bufferedAheadOf(ContentType.VIDEO, 15))
+              .toBe(35);
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 15))
+              .toBe(2000);
+        });
+
+    it('does not block remove operations while waiting for space', async () => {
+      await seed();
+      rejectNext();
+      const pending = append(20, 30, 1000);
+      await Util.fakeEventLoop(1);
+      const removal = mediaSourceEngine.remove(ContentType.VIDEO, 0, 10);
+      expect(videoSourceBuffer.remove).toHaveBeenCalledWith(0, 10);
+      finish(10, 20);
+      await removal;
+      mockVideo.currentTime = 10;
+      await Util.fakeEventLoop(1);
+      finish(10, 30);
+      await pending;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(2000);
+    });
+
+    it('cancels held data on clear and keeps the operation queue usable',
+        async () => {
+          await seed();
+          rejectNext();
+          const pending = append(20, 30, 1000);
+          const rejected = expectAsync(pending).toBeRejectedWith(
+              jasmine.objectContaining({
+                code: shaka.util.Error.Code.OPERATION_ABORTED,
+              }));
+          await Util.fakeEventLoop(1);
+          const cleared = mediaSourceEngine.clear(ContentType.VIDEO);
+          videoSourceBuffer.buffered = createFakeBuffered([]);
+          videoSourceBuffer.updateend();
+          await cleared;
+          await rejected;
+          const next = append(50, 60, 500);
+          finish(50, 60);
+          await next;
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+              .toBe(500);
+        });
+
+    it('cancels held data on destruction', async () => {
+      await seed();
+      rejectNext();
+      const pending = append(20, 30, 1000);
+      const rejected = expectAsync(pending).toBeRejected();
+      await Util.fakeEventLoop(1);
+      await mediaSourceEngine.destroy();
+      await rejected;
+      await Util.fakeEventLoop(5);
+      expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+    });
+
+    it('returns to normal recovery when the playhead cannot advance',
+        async () => {
+          await seed();
+          videoSourceBuffer.appendBuffer.and.callFake(() => {
+            throw new DOMException('full', 'QuotaExceededError');
+          });
+          const pending = append(20, 30, 1000);
+          const rejected = expectAsync(pending).toBeRejectedWith(
+              jasmine.objectContaining({
+                code: shaka.util.Error.Code.QUOTA_EXCEEDED_ERROR,
+              }));
+          await Util.fakeEventLoop(6);
+          await rejected;
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+        });
+
+    it('does not wait for a segment larger than the observed capacity',
+        async () => {
+          await seed();
+          rejectNext();
+          await expectAsync(append(20, 30, 3000)).toBeRejected();
+          expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 0))
+              .toBe(false);
+        });
+
+    it('keeps audio and video budgets independent', async () => {
+      await seed();
+      await seed(ContentType.AUDIO);
+      rejectNext();
+      const pending = append(20, 30, 1000);
+      await Util.fakeEventLoop(1);
+      expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 0)).toBe(true);
+      expect(mediaSourceEngine.isBufferFull(ContentType.AUDIO, 0)).toBe(false);
+      const audio = append(20, 30, 1000, ContentType.AUDIO);
+      finish(0, 30, ContentType.AUDIO);
+      await audio;
+      mockVideo.currentTime = 10;
+      await Util.fakeEventLoop(1);
+      finish(0, 30);
+      await pending;
+    });
+
+    it('leaves chunked appends to the StreamingEngine fallback', async () => {
+      const first = append(0, 10, 1000, ContentType.VIDEO, () => true, true);
+      finish(0, 10);
+      await first;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(0);
+      rejectNext();
+      await expectAsync(
+          append(10, 20, 1000, ContentType.VIDEO, () => true, true))
+          .toBeRejectedWith(jasmine.objectContaining(
+              {code: shaka.util.Error.Code.QUOTA_EXCEEDED_ERROR}));
+      expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(2);
+    });
+
+    it('recovers simultaneous audio and video errors independently',
+        async () => {
+          await seed();
+          await seed(ContentType.AUDIO);
+          rejectNext();
+          rejectNext(ContentType.AUDIO);
+          const video = append(20, 30, 1000);
+          const audio = append(20, 30, 1000, ContentType.AUDIO);
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          expect(audioSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          mockVideo.currentTime = 10;
+          await Util.fakeEventLoop(1);
+          finish(0, 30);
+          finish(0, 30, ContentType.AUDIO);
+          await Promise.all([video, audio]);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+          expect(audioSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+        });
+
+    it('does not replay successful video when muxed audio hits quota',
+        async () => {
+          const muxedAudio = makeFakeStream('audio/mp4');
+          muxedAudio.fullMimeTypes = new Set([muxedAudio.mimeType]);
+          muxedAudio.isAudioMuxedInVideo = true;
+          await mediaSourceEngine.init(new Map([
+            [ContentType.VIDEO, fakeVideoStream],
+            [ContentType.AUDIO, muxedAudio],
+          ]), false);
+          await seed();
+          await seed(ContentType.AUDIO);
+          rejectNext(ContentType.AUDIO);
+          const pending = append(20, 30, 1000);
+          finish(0, 30);
+          await Util.fakeEventLoop(1);
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          expect(audioSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          mockVideo.currentTime = 10;
+          await Util.fakeEventLoop(1);
+          finish(0, 30, ContentType.AUDIO);
+          await pending;
+          expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(3);
+          expect(audioSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+          // Audio's learned cap also constrains the logical video stream.
+          expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 10))
+              .toBe(true);
+        });
+
+    it('drops held data and byte estimates when a SourceBuffer is removed',
+        async () => {
+          await seed();
+          rejectNext();
+          const pending = append(20, 30, 1000);
+          const rejected = expectAsync(pending).toBeRejected();
+          await Util.fakeEventLoop(1);
+          await mediaSourceEngine.removeSourceBuffer(ContentType.VIDEO);
+          await rejected;
+          expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+              .toBe(0);
+          expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 0))
+              .toBe(false);
+        });
+
+    it('drops held data and byte estimates on MediaSource reset', async () => {
+      await seed();
+      rejectNext();
+      const pending = append(20, 30, 1000);
+      const rejected = expectAsync(pending).toBeRejected();
+      await Util.fakeEventLoop(1);
+      await mediaSourceEngine.reset(new Map([
+        [ContentType.VIDEO, fakeVideoStream],
+      ]));
+      await rejected;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(0);
+      expect(mediaSourceEngine.isBufferFull(ContentType.VIDEO, 0)).toBe(false);
+    });
+
+    it('stops holding data when byte recovery is disabled', async () => {
+      await seed();
+      rejectNext();
+      let enabled = true;
+      const pending = append(20, 30, 1000, ContentType.VIDEO, () => enabled);
+      await Util.fakeEventLoop(1);
+      enabled = false;
+      await Util.fakeEventLoop(1);
+      expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(4);
+      finish(0, 30);
+      await pending;
+    });
+
+    it('records actual output sizes after transmuxing', async () => {
+      await mediaSourceEngine.init(new Map([
+        [ContentType.VIDEO, fakeTransportStream],
+      ]), false);
+      mockTransmuxer.transmux.and.returnValue(Promise.resolve({
+        init: new Uint8Array(100),
+        data: new Uint8Array(2000),
+      }));
+      const pending = append(0, 10, 5000);
+      await Util.fakeEventLoop(1);
+      // First complete the generated init segment, then the media payload.
+      videoSourceBuffer.updateend();
+      await Util.fakeEventLoop(1);
+      finish(0, 10);
+      await pending;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 0))
+          .toBe(2000);
+    });
+
+    it('leaves sequence mode to the StreamingEngine fallback', async () => {
+      await mediaSourceEngine.init(new Map([
+        [ContentType.VIDEO, fakeVideoStream],
+      ]), true);
+      const pending = append(0, 10, 1000);
+      finish(40, 50);
+      await pending;
+      expect(mediaSourceEngine.bufferedBytesAheadOf(ContentType.VIDEO, 45))
+          .toBe(0);
+      rejectNext();
+      await expectAsync(append(10, 20, 1000))
+          .toBeRejectedWith(jasmine.objectContaining(
+              {code: shaka.util.Error.Code.QUOTA_EXCEEDED_ERROR}));
+      expect(videoSourceBuffer.appendBuffer).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('appendBuffer', () => {
     beforeEach(async () => {
       requiresEC3InitSegments.and.returnValue(false);

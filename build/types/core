@@ -47,6 +47,7 @@
 +../../lib/drm/playready.js
 
 +../../lib/media/adaptation_set.js
++../../lib/media/buffer_byte_tracker.js
 +../../lib/media/buffering_observer.js
 +../../lib/media/clearkey_webcrypto_decryptor.js
 +../../lib/media/closed_caption_parser.js
